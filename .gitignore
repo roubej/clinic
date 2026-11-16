@@ -1,7 +1,9 @@
-.venv/
-.venv*/
 __pycache__/
 *.py[cod]
+.venv*/
+!.venv.example
+.pytest_cache/
+.DS_Store
 .env
 .env.*
 !.env.example

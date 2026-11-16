@@ -1,86 +1,112 @@
-"""Fill Cassandra with synthetic doctors, patients, visits and appointments.
+"""Fill the database with demo data.
 
 Usage:
-    python seed.py            # seed an empty database
-    python seed.py --reset    # wipe all tables first, then seed
+    python seed.py            # only seeds an empty database
+    python seed.py --reset    # empties every table first, then seeds
+
+The random generator is seeded, so every run produces the same demo data.
 """
 from __future__ import annotations
 
-import argparse
 import random
-from datetime import timedelta
+import sys
+from datetime import date, datetime, time, timedelta
 
-from faker import Faker
+from db import slots
+from db.connection import connect
+from db.repository import ClinicError, ClinicRepository
 
-from db import DEPARTMENTS, SLOT_TIMES, Clinic, utc_now
-from datetime import datetime
+random.seed(42)
 
-SUMMARIES = [
-    "Routine check-up, no concerns",
-    "Blood pressure follow-up",
-    "Persistent cough, chest clear",
-    "Migraine, advised rest and hydration",
-    "Back pain, referred to physiotherapy",
-    "Seasonal allergies, antihistamine prescribed",
-    "Diabetes review, medication adjusted",
-    "Stomach pain, dietary advice given",
+FIRST_NAMES = [
+    "Amira", "Youssef", "Salma", "Mehdi", "Nour", "Karim", "Ines", "Hamza", "Leila", "Omar",
+    "Yasmine", "Rami", "Sana", "Walid", "Mariem", "Aymen", "Rim", "Bilel", "Hiba", "Fares",
+    "Asma", "Skander", "Emna", "Tarek", "Dorra",
 ]
-REASONS = ["Follow-up", "Routine check-up", "Lab results review", "New symptoms",
-           "Prescription renewal"]
+LAST_NAMES = [
+    "Ben Salah", "Trabelsi", "Gharbi", "Jlassi", "Mansouri", "Hammami", "Bouazizi", "Chaabane",
+    "Khelifi", "Mejri", "Sassi", "Ayari", "Dridi", "Fourati", "Zouari",
+]
+DOCTORS = [
+    # name, specialty, working days, start, end, slot minutes
+    ("Dr. Sonia Haddad", "General medicine", [1, 2, 3, 4, 5], time(8, 0), time(16, 0), 30),
+    ("Dr. Anis Ben Amor", "Cardiology", [1, 3, 5], time(9, 0), time(15, 0), 30),
+    ("Dr. Rania Cherif", "Pediatrics", [1, 2, 3, 4], time(8, 30), time(14, 30), 20),
+    ("Dr. Malek Toumi", "Dermatology", [2, 4, 6], time(10, 0), time(17, 0), 30),
+]
+REASONS = [
+    "Routine check-up", "Follow-up visit", "Blood pressure check", "Persistent cough",
+    "Skin rash", "Vaccination", "Back pain", "Headaches", "Prescription renewal", "Test results",
+]
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--patients", type=int, default=30)
-    ap.add_argument("--reset", action="store_true", help="wipe all tables first")
-    ap.add_argument("--seed", type=int, default=42)
-    args = ap.parse_args()
+    reset = "--reset" in sys.argv
+    cluster, session = connect()
+    repo = ClinicRepository(session)
 
-    random.seed(args.seed)
-    Faker.seed(args.seed)
-    fake = Faker()
-    clinic = Clinic()
+    if reset:
+        repo.truncate_all()
+        print("All tables emptied.")
+    elif repo.count_patients() > 0 or repo.list_doctors():
+        sys.exit("The database already has data. Run `python seed.py --reset` to start over.")
 
-    if args.reset:
-        clinic.truncate_all()
-        print("Tables wiped.")
-    elif clinic.list_doctors():
-        print("Database already has data. Run `python seed.py --reset` to start over.")
-        return
+    # Doctors
+    doctors = []
+    for name, specialty, days, start, end, minutes in DOCTORS:
+        doctor_id = repo.create_doctor(name, specialty, days, start, end, minutes)
+        doctors.append(repo.get_doctor(doctor_id))
 
-    doctors = [clinic.add_doctor(f"Dr. {fake.first_name()} {fake.last_name()}", dept)
-               for dept in DEPARTMENTS for _ in range(2)]
-    print(f"Created {len(doctors)} doctors")
-
+    # Patients (unique phone numbers, thanks to the claim on patients_by_phone)
     patients = []
-    for _ in range(args.patients):
-        gender = random.choice(["F", "M"])
-        first = fake.first_name_female() if gender == "F" else fake.first_name_male()
-        dob = (utc_now() - timedelta(days=random.randint(1 * 365, 90 * 365))).date()
-        patients.append(clinic.add_patient(f"{first} {fake.last_name()}", dob, gender,
-                                           fake.phone_number()))
-    print(f"Created {len(patients)} patients")
+    for i in range(25):
+        first, last = FIRST_NAMES[i], random.choice(LAST_NAMES)
+        while True:
+            phone = f"+216{random.randint(20_000_000, 99_999_999)}"
+            email = f"{first.lower()}.{last.lower().replace(' ', '')}{i}@example.com"
+            birth = date(random.randint(1950, 2018), random.randint(1, 12), random.randint(1, 28))
+            try:
+                patient_id = repo.create_patient(first, last, phone, email, birth)
+                break
+            except ClinicError:
+                continue  # phone already used, draw another one
+        patients.append(repo.get_patient(patient_id))
 
-    visits = 0
-    for p in patients:
-        for _ in range(random.randint(1, 3)):
-            when = utc_now() - timedelta(days=random.randint(1, 365), hours=random.randint(0, 8))
-            clinic.add_visit(p, random.choice(doctors), random.choice(SUMMARIES),
-                             fake.sentence(nb_words=12), when)
-            visits += 1
-    print(f"Created {visits} past visits")
+    # Appointments from two weeks ago to two weeks ahead
+    now = datetime.now()
+    today = date.today()
+    created = {"scheduled": 0, "completed": 0, "cancelled": 0}
+    for offset in range(-14, 15):
+        day = today + timedelta(days=offset)
+        for doctor in doctors:
+            day_slots = slots.generate_slots(doctor, day)
+            for slot in random.sample(day_slots, k=int(len(day_slots) * 0.4)):
+                patient = random.choice(patients)
+                try:
+                    appt = repo.book_appointment(
+                        patient, doctor, day, slot, random.choice(REASONS), allow_past=True
+                    )
+                except ClinicError:
+                    continue
+                in_past = datetime.combine(day, slot) < now
+                roll = random.random()
+                if in_past:
+                    if roll < 0.75:
+                        repo.complete_appointment(appt)
+                        created["completed"] += 1
+                    elif roll < 0.9:
+                        repo.cancel_appointment(appt)
+                        created["cancelled"] += 1
+                    else:
+                        created["scheduled"] += 1  # a visit nobody closed yet
+                elif roll < 0.9:
+                    created["scheduled"] += 1
+                else:
+                    repo.cancel_appointment(appt)
+                    created["cancelled"] += 1
 
-    booked = 0
-    for _ in range(60):
-        day = (utc_now() + timedelta(days=random.randint(1, 30))).date()
-        slot = datetime.combine(day, random.choice(SLOT_TIMES))
-        if clinic.book_appointment(random.choice(patients), random.choice(doctors), slot,
-                                   random.choice(REASONS)):
-            booked += 1
-    print(f"Booked {booked} future appointments")
-
-    clinic.cluster.shutdown()
-    print("\nDone. Next: streamlit run app.py")
+    print(f"Created {len(doctors)} doctors, {len(patients)} patients and appointments: {created}")
+    cluster.shutdown()
 
 
 if __name__ == "__main__":
