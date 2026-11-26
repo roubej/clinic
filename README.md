@@ -1,143 +1,163 @@
 # Clinic Appointments
 
-A web app for a small clinic: manage patients and doctors, book appointments, and follow the activity on a dashboard. The interface is built with **Streamlit** and the data lives in **Apache Cassandra**.
+A Streamlit clinic app backed by a three-node Apache Cassandra cluster. Patients
+sign in to their own portal, doctors see their own agenda and patients with
+appointments to them, and administrators manage the clinic.
 
-A doctor's time slot can only be booked once, even if two people click at the same moment.
-
-## Features
-
-- **Patients**: add, search, edit, delete (name, phone, email, date of birth). Phone numbers are unique.
-- **Doctors**: add and edit, with working days, working hours and slot length.
-- **Appointments**: book, cancel, mark as completed, reschedule. Statuses: `scheduled`, `completed`, `cancelled`.
-- **Views**: a doctor's agenda for one day, a patient's history, upcoming appointments for the whole clinic.
-- **Dashboard**: appointments per day, per doctor and per status (Plotly charts).
-- Every form is validated (empty fields, invalid email or phone, dates in the past, slots outside working hours).
+This is a development/demo project. It is not ready for real patient data:
+patient sign-up does not verify email or phone ownership, and production
+identity, Cassandra authentication/TLS, audit, backup, HTTPS, and regulatory
+controls are not included.
 
 ## Requirements
 
-- Python 3.11 or 3.12
-- Docker (to run Cassandra locally)
+- Docker Desktop with Docker Compose, with enough memory for three Cassandra nodes
+- Python 3.11 for local tests
 
-## Quick start
+The local Compose setup puts all three Cassandra nodes on one computer. It can
+tolerate a Cassandra container/node failure, but not a failure of that computer,
+Docker Desktop, or its storage.
 
-```bash
-# 1. Get the code and install the dependencies
-cd clinic-appointments
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+## Run locally
 
-# 2. Start Cassandra (the first start takes about a minute)
-docker compose up -d
-docker compose ps                  # wait until the status says "healthy"
+From the project directory in PowerShell:
 
-# 3. Create the keyspace and the tables
-python -m db.init_schema
-
-# 4. Optional: load demo data (4 doctors, 25 patients, appointments from two weeks ago to two weeks ahead)
-python seed.py
-
-# 5. Run the app
-streamlit run app.py
+```powershell
+docker compose up -d --build
+docker compose ps
 ```
 
-The app opens at http://localhost:8501.
+On the first launch, Cassandra may take several minutes to initialize its three
+nodes. Wait until all three Cassandra services are `healthy` and the `app`
+service is running. The app keeps retrying the schema connection during startup.
+It creates or updates the schema once Cassandra is ready. Open
+http://localhost:8501.
 
-To start over with fresh demo data: `python seed.py --reset`.
-To stop Cassandra: `docker compose down` (add `-v` to also delete the data).
+Create the first administrator from a second PowerShell window:
 
-If Cassandra runs somewhere else, set `CASSANDRA_HOSTS` (comma-separated) and `CASSANDRA_PORT` before starting the app.
+```powershell
+docker compose exec app python -m db.create_admin
+```
+
+The command prompts for a username and password. Passwords must be 12–128
+characters. Sign in with that administrator account to create doctor profiles
+and their portal accounts, manage patient profiles, and access the clinic
+dashboard. Existing patient profiles can be given portal accounts from the
+Patients page. New patients can register from the sign-in page.
+
+Optional synthetic demo data:
+
+```powershell
+docker compose exec app python seed.py
+```
+
+`seed.py --reset` clears the clinic tables, including all login accounts. If you
+use it, you must create a new administrator with `db.create_admin` afterward.
+
+Run the unit tests on the host using your Python 3.11 environment:
+
+```powershell
+.\.venv311\Scripts\python.exe -m pytest -q
+```
+
+Stop the containers but keep their data:
+
+```powershell
+docker compose down
+```
+
+**Do not use `docker compose down -v` unless you intend to delete all Cassandra
+data.**
+
+## Portals and permissions
+
+- **Patient:** can book appointments, view their own appointment history, and
+  cancel their own scheduled appointments.
+- **Doctor:** can view their own agenda and patient details only for patients
+  with an appointment on the selected day. Their displayed patient history is
+  limited to appointments with that doctor.
+- **Administrator:** can manage clinic-wide patients, doctors, appointments,
+  schedules, and dashboards.
+
+Patients self-register using their email as the username. An administrator
+creates doctor accounts and can provision accounts for existing patients.
+Administrators are created only with the local `db.create_admin` command; there
+is no public admin sign-up. Passwords are stored as salted scrypt hashes.
+
+Local accounts have no email verification or password-recovery flow. Do not
+deploy this app publicly with real health information as-is.
+
+## Cassandra availability
+
+The three Cassandra services are **nodes in one Cassandra cluster**, not three
+independent clusters. They share the `datacenter1` data center and replicate
+each keyspace partition to all three nodes (`NetworkTopologyStrategy`, RF=3).
+The application uses `LOCAL_QUORUM` for reads and writes and `LOCAL_SERIAL` for
+lightweight transactions. It can continue reads and writes when one node is
+down; if fewer than two replicas are available, quorum operations fail rather
+than accepting potentially inconsistent writes.
+
+Check cluster membership:
+
+```powershell
+docker compose exec cassandra1 nodetool status
+```
+
+Ports 9042–9044 are published only on localhost for local inspection. The app
+container connects to Cassandra over the private Compose network. Do not expose
+Cassandra ports to the public internet.
+
+For real host-level availability, deploy the three nodes on separate machines
+or failure domains, configure Cassandra networking/firewalls and the correct
+data center, then set `CASSANDRA_HOSTS` to their reachable addresses. Three
+containers on one computer do not protect against that computer or its disk
+being unavailable.
+
+### Existing single-node data
+
+Back up existing data before changing a single-node installation. The first
+Cassandra volume is retained as `cassandra_data`; the other nodes get new
+volumes. The schema startup changes the keyspace replication factor to 3, but
+changing replication settings does not itself copy existing rows to the new
+nodes. After all three nodes have joined, repair the keyspace on each node
+before relying on the old data:
+
+```powershell
+docker compose exec cassandra1 nodetool repair clinic
+docker compose exec cassandra2 nodetool repair clinic
+docker compose exec cassandra3 nodetool repair clinic
+```
+
+If existing data is not needed, back it up if desired, then remove the specific
+project volumes only after confirming the volume names with `docker volume ls`.
 
 ## Project structure
 
-```
-clinic-appointments/
-  app.py                       home page (counters and today's appointments)
-  ui.py                        helpers shared by the pages
-  pages/
-    1_Patients.py
-    2_Doctors.py
-    3_Appointments.py          book / cancel / complete / reschedule
-    4_Agenda.py                doctor's day + upcoming appointments
-    5_Patient_History.py
-    6_Dashboard.py
-  db/
-    schema.cql                 keyspace and tables
-    init_schema.py             runs schema.cql
-    connection.py              Cassandra session (cached by Streamlit)
-    repository.py              every CQL query lives here
-    slots.py                   slot generation and checks (no database access)
-    validators.py              input validation
-  tests/                       unit tests for slots and validators
-  seed.py                      demo data
-  docker-compose.yml           Cassandra 4.1
-  requirements.txt
+```text
+app.py                      role-aware login and navigation
+auth_ui.py                  sign-in and patient self-registration
+app_pages/                  admin, doctor, patient, and account pages
+ui.py                       shared Streamlit helpers and page access checks
+db/
+  connection.py             multi-node Cassandra connection and quorum settings
+  create_admin.py           interactive initial-admin setup
+  init_schema.py            schema initialization
+  repository.py             Cassandra queries and clinic operations
+  schema.cql                keyspace and table definitions
+  security.py               password hashing and verification
+  slots.py                  appointment-slot rules
+  validators.py             patient and doctor input validation
+seed.py                     synthetic demo data
+docker-compose.yml           three Cassandra nodes and the app service
+Dockerfile                  Streamlit app image
+tests/                      unit tests
 ```
 
-The pages never contain CQL. They call `db/repository.py`, which keeps the queries in one place.
-
-## Data model
-
-Cassandra has no joins, so each table is designed around one question the app asks.
-
-| Table | Primary key | Why it exists |
-|---|---|---|
-| `patients` | `patient_id` | Read, edit and delete a patient. |
-| `patients_by_phone` | `phone` | Cassandra cannot enforce a unique column, so the phone number is a primary key and is claimed with `IF NOT EXISTS`. |
-| `doctors` | `doctor_id` | Doctor profile and schedule rules. |
-| `appointments_by_doctor` | `((doctor_id, appt_date), slot_time)` | The doctor's agenda. One partition per doctor and day, one row per slot, so a slot cannot exist twice. |
-| `appointments_by_patient` | `(patient_id, appt_datetime DESC, appointment_id)` | A patient's history, newest first. |
-
-An appointment is written to both appointment tables. The `schema.cql` file has the full column list.
-
-## How double-booking is prevented
-
-Booking runs in three steps:
-
-1. `INSERT ... IF NOT EXISTS` on `appointments_by_doctor`. This is a lightweight transaction (LWT). Only one request can win a given slot.
-2. If it succeeds, the appointment is copied to `appointments_by_patient`.
-3. If step 2 fails, the slot row from step 1 is deleted, so no half-booked slot stays behind.
-
-A logged batch is not used here: Cassandra does not allow a conditional (LWT) statement in a batch that touches several partitions, and the two tables are in different partitions.
-
-A cancelled appointment keeps its row. Booking it again uses `UPDATE ... IF status = 'cancelled'`, which is also an LWT. Cancel and complete use `IF appointment_id = ? AND status = 'scheduled'`, so two people cannot close the same appointment twice.
-
-Rescheduling books the new slot first and cancels the old one only if that worked.
-
-## Design notes and limits
-
-- Patient and doctor names are copied into appointment rows. Renaming someone does not change appointments that already exist.
-- Changing a doctor's working hours does not move existing appointments.
-- A patient with scheduled appointments cannot be deleted. Cancel or complete them first.
-- Name search is done in Python, because Cassandra has no `LIKE`. This is fine for a clinic-sized table.
-- The dashboard and the upcoming list read one partition per doctor and day, in parallel. The dashboard is limited to 92 days.
-- Times are the clinic's local wall-clock time. No time zone conversion is done.
-- `SimpleStrategy` with a replication factor of 1 is meant for one local node. A real cluster needs `NetworkTopologyStrategy` and a higher replication factor.
-- There is no login. Anyone who can open the app can edit the data.
-
-## Tests
-
-```bash
-pip install pytest
-python -m pytest -q
-```
-
-The tests cover slot generation, free slots, slot checks and input validation. They do not need Cassandra.
+Cassandra stores appointments in separate tables for doctor agendas and patient
+history, because Cassandra has no joins. Booking uses a conditional insert to
+prevent two users from claiming the same doctor/time slot.
 
 ## Screenshots
 
-Add your own here once the app runs:
-
-| Page | Screenshot |
-|---|---|
-| Home | `docs/home.png` |
-| Book an appointment | `docs/book.png` |
-| Doctor's agenda | `docs/agenda.png` |
-| Dashboard | `docs/dashboard.png` |
-
-## Troubleshooting
-
-- **"Cannot reach the Cassandra database"** in the app: run `docker compose ps`, wait for `healthy`, then `python -m db.init_schema`.
-- **`init_schema` keeps waiting**: Cassandra needs about a minute on first start. It retries for 2.5 minutes.
-- **Port 9042 already in use**: stop the other Cassandra, or change the left side of `9042:9042` in `docker-compose.yml` and set `CASSANDRA_PORT`.
-- **Container uses too much memory**: the heap is already limited to 512 MB in `docker-compose.yml`.
+See [SCREENSHOTS.md](SCREENSHOTS.md) for the sign-in and patient sign-up page
+captures.

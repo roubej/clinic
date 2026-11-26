@@ -5,6 +5,7 @@ import streamlit as st
 
 import ui
 from db.repository import ClinicError
+from db.security import password_error
 from db.validators import normalize_phone, validate_patient
 
 repo = ui.setup("Patients", "🧑")
@@ -141,3 +142,41 @@ with tab_edit:
             else:
                 ui.flash("success", "Patient deleted.")
                 st.rerun()
+
+        st.divider()
+        account_username = repo.get_account_for_identity("patient", patient_id)
+        if account_username:
+            st.caption(f"Patient portal username: {account_username}")
+        else:
+            st.markdown("**Create patient portal access**")
+            with st.form(f"patient_account_form_{k}"):
+                account_name = st.text_input(
+                    "Username",
+                    value=p["email"] or "",
+                    key=f"patient_username_{k}",
+                )
+                account_password = st.text_input(
+                    "Initial password (12–128 characters)",
+                    type="password",
+                    key=f"patient_password_{k}",
+                )
+                account_submitted = st.form_submit_button("Create portal account")
+            if account_submitted:
+                password_problem = password_error(account_password)
+                if not account_name.strip():
+                    st.error("Username is required.")
+                elif password_problem:
+                    st.error(password_problem)
+                else:
+                    try:
+                        repo.create_account(
+                            account_name,
+                            account_password,
+                            "patient",
+                            patient_id,
+                        )
+                    except ClinicError as exc:
+                        st.error(str(exc))
+                    else:
+                        ui.flash("success", "Patient portal account created.")
+                        st.rerun()

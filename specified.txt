@@ -1,0 +1,495 @@
+CLINIC APPOINTMENTS PROJECT
+==========================
+
+1. PURPOSE AND SCOPE
+--------------------
+This is a small-clinic appointment-management prototype. It is a web app built
+with Python, Streamlit, and Apache Cassandra, and it is run locally with Docker
+Compose.
+
+The project covers patient and doctor profiles, doctor schedules, appointment
+booking and status changes, role-specific portal pages, and administrative
+appointment reporting. It is not a complete hospital information system or
+electronic health-record (EHR) product. It does not provide clinical charting,
+diagnoses, prescriptions, laboratory workflows, billing, insurance claims, or
+hospital-wide resource management.
+
+The app's local address is http://localhost:8501. The source and project
+instructions are in this directory; the live database is kept in Docker
+volumes, not in a local database file in the project.
+
+2. TECHNOLOGY AND RUNTIME
+-------------------------
+- Python: the app image is based on python:3.11-slim.
+- Web UI: Streamlit (requirements specify streamlit >= 1.40).
+- Database driver: Cassandra Python driver (cassandra-driver >= 3.29).
+- Database: Apache Cassandra 4.1.
+- Data tables and charts: pandas >= 2.0 and Plotly >= 5.20.
+- Containers: Docker Compose runs one Streamlit app service and three
+  Cassandra node services.
+- App container name: clinic-app.
+- Cassandra container names: clinic-cassandra-1, clinic-cassandra-2, and
+  clinic-cassandra-3.
+- Web port: host port 8501 is mapped to the app container's port 8501.
+- Cassandra ports: host 127.0.0.1 ports 9042, 9043, and 9044 map to port 9042
+  inside Cassandra containers. These database ports are bound to localhost.
+- The app container connects to Cassandra using the private Compose service
+  names cassandra1,cassandra2,cassandra3 on port 9042.
+
+The app service runs the database schema initializer before starting Streamlit.
+The initializer retries Cassandra connections up to 120 times, waiting five
+seconds between attempts (up to about ten minutes). First-time Cassandra
+initialization can take several minutes. The Compose health check runs cqlsh
+and allows a ten-minute start period.
+
+The app port is published on the host by Compose. A local login screen is not a
+substitute for a production network boundary, HTTPS, or secure deployment
+configuration.
+
+3. PORTALS, PAGES, AND PERMISSIONS
+----------------------------------
+
+Sign-in:
+- The sign-in page offers a shared login entry for patient, doctor, and admin
+  accounts.
+- The account role determines which main pages appear in the sidebar.
+- A user's account is rechecked against Cassandra on Streamlit reruns; missing,
+  disabled, or mismatched account identity clears the local signed-in session.
+- Page helpers also check allowed roles before rendering protected pages.
+- All roles have an Account page for changing their own password.
+
+Patient portal:
+- Patient self-registration creates a patient profile and a patient account.
+- The email entered during signup is used as the login username.
+- A patient selects a doctor, date, available time, and reason for the visit.
+- Patients can see their own scheduled appointments and their own appointment
+  history, and cancel their own scheduled appointments.
+- The patient page looks up records using the identity attached to the signed-in
+  account; it does not offer a patient selector.
+- Patient self-signup creates a new profile. For an existing patient record,
+  the administrator must provision portal access instead of creating a second
+  profile through signup.
+
+Doctor portal:
+- Doctor accounts are created by an administrator and tied to a doctor profile.
+- A doctor can see their own agenda for a selected date and scheduled
+  appointments up to the next 30 days.
+- For linked appointments, the doctor can view patient phone, email, and date
+  of birth, and that patient's appointment history with that same doctor.
+- Doctors can mark their scheduled appointments completed.
+- The doctor portal does not provide a selector for another doctor's records.
+
+Administrator pages:
+- Overview: patient count, doctor count, scheduled appointments for today, and
+  today's scheduled appointment list.
+- Patients: search by name, phone, or email; add patients; edit patient
+  information; delete eligible patients; create portal accounts for existing
+  patient profiles.
+- Doctors: add a doctor with a schedule and initial login; edit doctor details
+  and schedule; create portal access for a doctor profile that lacks an account.
+- Appointments: book an appointment for a selected patient, doctor, and slot;
+  mark scheduled appointments completed; cancel; or reschedule.
+- Agenda: inspect one doctor's day, see free/booked slots, and filter upcoming
+  scheduled appointments by doctor and a period from 1 to 60 days.
+- Patient History: review appointment status counts and filter a patient's
+  history by status.
+- Dashboard: clinic-wide date and doctor filters, total and status metrics,
+  charts by day and doctor, and a status chart. The selected date range is
+  limited to 92 days.
+
+Page enforcement is in app.py and ui.py. The main role-specific page files are
+app_pages/patient_portal.py, app_pages/doctor_portal.py,
+app_pages/1_Patients.py, app_pages/2_Doctors.py, app_pages/3_Appointments.py,
+app_pages/4_Agenda.py, app_pages/5_Patient_History.py,
+app_pages/6_Dashboard.py, app_pages/admin_home.py, and app_pages/account.py.
+
+4. ACCOUNTS AND PASSWORDS
+-------------------------
+- Patient signup is public on the sign-in screen; there is no public doctor or
+  administrator signup.
+- The first administrator is created from a PowerShell window using:
+  docker compose exec app python -m db.create_admin
+- Administrators create doctor portal accounts and can create portal accounts
+  for existing patient profiles.
+- Usernames are stripped of surrounding whitespace and case-folded before
+  lookup, so username matching is case-insensitive.
+- Passwords must be between 12 and 128 characters. No additional complexity
+  rules are enforced by the current password validator.
+- Passwords are stored as salted scrypt hashes, not plaintext. Current hashing
+  parameters are N=2^14, r=8, p=1, a 16-byte random salt, and a 32-byte output.
+  Hash comparison uses a constant-time comparison.
+- Users can change their password by entering the current password and
+  confirming a new password on the Account page.
+- There is no password recovery process, MFA, email verification, or phone
+  verification.
+- The account tables store a role, identity UUID, enabled flag, salt, hash, and
+  creation timestamp. A secondary account-by-identity table enforces one
+  account per patient or doctor profile.
+- Seeded patient and doctor profiles do not automatically receive login
+  accounts. An administrator must provision accounts for profiles that should
+  sign in. The seed script does not create a default password.
+
+5. PATIENT AND DOCTOR VALIDATION
+--------------------------------
+Patient form checks:
+- First and last name are required.
+- Phone number is required and must contain 8 to 15 digits.
+- Phone formatting is normalized to digits and an optional leading plus sign.
+- Email is required and checked with a basic address-format rule.
+- Date of birth is required, cannot be in the future, and cannot be before 1900.
+- A phone lookup table is used to claim a phone number uniquely.
+
+Doctor form checks:
+- Full name and specialty are required.
+- At least one working day must be selected.
+- End time must be after start time.
+- Working hours must contain at least one full appointment slot.
+- The UI allows slot lengths from 5 to 120 minutes, in five-minute increments.
+- ISO weekday numbering is used: 1=Monday through 7=Sunday.
+
+6. APPOINTMENT RULES AND BEHAVIOR
+---------------------------------
+- A doctor schedule consists of working weekdays, start and end times, and a
+  slot length in minutes.
+- Slots are generated at that interval only on selected working days. A slot is
+  included only when its full duration fits before or at the end of the
+  workday.
+- Past slots cannot be booked through normal patient and administrator booking
+  flows. Demo seeding deliberately has an option to create historical test
+  appointments.
+- A visit reason is required in the booking UI.
+- A slot is considered occupied if its appointment status is scheduled or
+  completed. Cancelled slots can be booked again.
+- The UI displays apparently free slots for convenience. The database
+  conditional write is the final authority if two people try to reserve the
+  same slot at nearly the same time.
+- Appointment statuses are scheduled, completed, and cancelled.
+- A doctor can mark their appointment completed. An administrator can mark an
+  appointment completed or cancel it. A patient can cancel their own scheduled
+  appointment.
+- Rescheduling books the replacement slot first, then cancels the old slot. If
+  the new slot is unavailable, the old appointment remains unchanged. If
+  cancelling the old one fails after the new booking succeeds, the new booking
+  is cancelled as a rollback attempt.
+- Appointment date/time values are treated as clinic wall-clock time in the
+  current app. The code does not provide a configurable, timezone-aware clinic
+  timezone service.
+- Patient and doctor names are copied into appointment rows as snapshots.
+  Renaming a profile does not rewrite historical appointment snapshots.
+
+7. CASSANDRA DATA MODEL
+-----------------------
+Cassandra has no relational joins. The schema therefore stores data in tables
+organized around the queries the app performs:
+
+clinic.patients:
+- One row per patient, partitioned by patient_id.
+- Stores first name, last name, phone, email, date of birth, and created time.
+
+clinic.patients_by_phone:
+- phone is the primary key and maps to patient_id.
+- Used to claim and look up a unique phone number.
+
+clinic.doctors:
+- One row per doctor_id.
+- Stores full name, specialty, working weekdays, start time, end time, and
+  appointment slot length.
+
+clinic.appointments_by_doctor:
+- Primary key: ((doctor_id, appt_date), slot_time).
+- One partition per doctor per date, with one row per time slot.
+- Stores appointment UUID, patient UUID and name snapshot, reason, status, and
+  creation timestamp.
+- This is the agenda query shape and the source of truth for slot ownership.
+
+clinic.appointments_by_patient:
+- Primary key: ((patient_id), appt_datetime, appointment_id), ordered newest
+  appointment first.
+- Stores appointment, doctor, reason, and status data for patient history.
+- The appointment is written to both the doctor and patient tables. Because
+  these are separate Cassandra partitions, this is not one relational
+  transaction; repository code attempts to undo the first write if the second
+  write fails.
+
+clinic.accounts_by_username:
+- Username is the primary key.
+- Stores role, linked identity UUID, password salt/hash, enabled flag, and
+  created timestamp.
+- Used for login lookup.
+
+clinic.accounts_by_identity:
+- Primary key: ((role, identity_id)).
+- Maps a patient/doctor/admin identity to a username and prevents a profile
+  from receiving multiple accounts for the same role.
+
+The appointment tables deliberately duplicate some data so agenda and history
+queries do not require a join. This is efficient for these screens but means
+writes must keep both copies consistent.
+
+8. DOUBLE-BOOKING PROTECTION AND CONSISTENCY
+--------------------------------------------
+- Before writing, the app checks that the requested slot matches the doctor's
+  schedule and is not in the past.
+- The app claims the doctor/date/time row with a Cassandra conditional
+  INSERT ... IF NOT EXISTS, using a lightweight transaction.
+- If that row already exists but is cancelled, a conditional update can reuse
+  the slot. If another active booking owns it, the user is told to choose
+  another time.
+- The app updates the patient-history table after claiming the doctor slot. If
+  the history write fails, it attempts to delete/release the claimed slot.
+- Status changes conditionally update the doctor agenda row only when the
+  expected appointment ID still owns a scheduled slot, then update the patient
+  history copy.
+- The Python driver uses a token-aware, local-data-center-aware load-balancing
+  policy for datacenter1.
+- Normal reads and writes use LOCAL_QUORUM; conditional/lightweight
+  transactions use LOCAL_SERIAL.
+
+These safeguards reduce duplicate slot claims and stale updates. They do not
+turn two separate Cassandra table writes into a general ACID transaction. A
+process or host failure between related writes can still require operational
+reconciliation.
+
+9. THREE-NODE AVAILABILITY DESIGN
+---------------------------------
+- All three Cassandra nodes belong to cluster ClinicCluster.
+- They use data center datacenter1 and rack rack1 in the local Compose setup.
+- Nodes 1 and 2 are seeds; the app uses all three node service names as contact
+  points.
+- The clinic keyspace uses NetworkTopologyStrategy with replication factor 3
+  in datacenter1.
+- Each Cassandra container is configured with MAX_HEAP_SIZE=512M and
+  HEAP_NEWSIZE=128M.
+- With RF=3 and LOCAL_QUORUM, one node can be unavailable while two replicas
+  still satisfy local quorum for reads and writes.
+- If fewer than two replicas are available, quorum operations fail rather than
+  silently accepting a write without quorum.
+- All three local nodes share the same machine, operating environment, and
+  local storage failure domain. They do not protect against a computer,
+  Docker Desktop, power, network, or disk failure.
+- For real host-level resilience, deploy nodes to separate machines or failure
+  domains and configure correct network access, data-center topology, and
+  CASSANDRA_HOSTS.
+- Cassandra ports are bound to 127.0.0.1 for local database inspection. Do not
+  expose these ports to the public internet.
+- The app is reached over the private Compose network when it talks to
+  Cassandra.
+
+Cluster membership can be checked with:
+  docker compose exec cassandra1 nodetool status
+
+The expected healthy state is UN (Up/Normal) for each node.
+
+10. DATA PERSISTENCE, MIGRATION, AND REPAIR
+-------------------------------------------
+- Cassandra data lives in Docker-managed named volumes, not in db/schema.cql
+  and not in a single project SQLite file.
+- Compose volumes are named cassandra_data, cassandra2_data, and
+  cassandra3_data.
+- "docker compose down" stops containers but preserves the volumes.
+- "docker compose down -v" removes the volumes and permanently deletes their
+  data; do not run it unless that deletion is intended.
+- Changing an existing keyspace from one replica to RF=3 changes replication
+  metadata but does not itself copy all existing rows to new replicas.
+- If keeping existing single-node data after adding nodes, back it up and run
+  nodetool repair for keyspace clinic on each node after the cluster is formed,
+  before relying on old records as fully replicated.
+- A regular backup schedule, restore test, and disaster-recovery process are not
+  configured by this project.
+
+Repair commands documented for the local Compose cluster:
+  docker compose exec cassandra1 nodetool repair clinic
+  docker compose exec cassandra2 nodetool repair clinic
+  docker compose exec cassandra3 nodetool repair clinic
+
+11. STARTUP, ADMIN SETUP, DEMO DATA, AND TESTS
+----------------------------------------------
+From PowerShell in the project folder:
+
+Start/build services:
+  docker compose up -d --build
+
+Check services:
+  docker compose ps
+
+Wait for all three Cassandra services to report healthy and for the app to be
+running. First Cassandra startup may take several minutes.
+
+Create the first administrator:
+  docker compose exec app python -m db.create_admin
+
+The command prompts interactively for username and password. There is no
+default admin password and no public admin signup.
+
+Seed synthetic demo data:
+  docker compose exec app python seed.py
+
+The seed script:
+- Uses a deterministic random seed.
+- Adds four sample doctors and 25 synthetic patient profiles.
+- Creates appointments across the period from 14 days before today through
+  14 days after today, with a mix of scheduled, completed, and cancelled
+  statuses.
+- Does not create login accounts for those demo patients or doctors.
+- Refuses to seed a non-empty clinic unless --reset is specified.
+
+WARNING: the destructive reset option is:
+  docker compose exec app python seed.py --reset
+
+It truncates clinic tables, including all login-account tables, and recreates
+synthetic demo data. Recreate an administrator afterward. Do not use this
+command if existing clinic records or accounts must be preserved.
+
+Run the unit tests using the documented Python 3.11 test environment:
+  .\.venv311\Scripts\python.exe -m pytest -q
+
+Stop containers while preserving their volumes:
+  docker compose down
+
+12. INPUT, PRIVACY, AND SECURITY LIMITATIONS
+--------------------------------------------
+The app stores personally identifying information: patient names, phone
+numbers, email addresses, dates of birth, and reasons for visits. A reason for
+an appointment could itself reveal sensitive health information.
+
+Existing security protections:
+- Passwords are stored as salted scrypt hashes, not plaintext.
+- Patient, doctor, and administrator roles have different navigation.
+- Protected pages check allowed roles.
+- Patient views are scoped to their own patient identity.
+- Doctor views are scoped to the signed-in doctor's identity and appointments.
+- Passwords have a 12-to-128-character length rule.
+- Database access uses parameterized/prepared Cassandra statements.
+- Cassandra ports are localhost-only in the supplied Compose file.
+
+Important protections not implemented:
+- Email or phone ownership checks during self-registration.
+- MFA, account lockout/rate limiting, password reset/recovery, or invitation
+  verification.
+- Central identity provider, organization-wide account lifecycle, or SSO.
+- A dedicated audit log of who viewed or changed patient records.
+- Cassandra client authentication, role authorization, or TLS encryption.
+- HTTPS termination and production reverse-proxy/security configuration.
+- A tested encrypted backup and recovery process.
+- Monitoring, alerting, operational incident response, and formal privacy or
+  regulatory certification.
+- External integrations such as EHR, prescribing, lab, insurance, or billing
+  systems.
+- Email/SMS appointment reminders and patient communications.
+
+The project is a development/demo prototype. Do not deploy it publicly with
+real patient data or treat it as a certified hospital system.
+
+13. COMPARISON WITH A BASIC HOSPITAL/CLINIC WEBSITE
+--------------------------------------------------
+Compared with a static informational site or contact-form booking workflow,
+this project provides:
+- An authenticated workflow for patients instead of relying only on calls or
+  manual form processing.
+- Different patient, doctor, and administrator screens.
+- Doctor working schedules and availability-based appointment selection.
+- Database conditional slot claiming to prevent two simultaneous bookings for
+  the same doctor and time.
+- Patient appointment history and doctor agendas.
+- Administrative booking, cancellation, completion, rescheduling, and
+  analytics.
+- Local Docker setup and use of open-source software.
+
+Those are advantages for a prototype or a small clinic that needs a basic
+scheduling workflow. They do not establish that it is better than a mature
+hospital website. Hospital platforms may include clinical records, integration
+with other hospital systems, secure communications, billing, mature identity
+management, audited access, legal compliance, and staffed support. This
+project does not supply those capabilities.
+
+The accurate positioning is: a useful appointment-scheduling prototype and
+learning foundation that needs substantial security, operations, integration,
+and compliance work before any real-world medical deployment.
+
+14. PROJECT FILE MAP
+--------------------
+app.py
+  Streamlit entry point, login-state validation, and role-based navigation.
+
+auth_ui.py
+  Sign-in and patient self-registration UI.
+
+ui.py
+  Shared UI functions, role/page access checks, table/chart helpers, labels,
+  and display formatting.
+
+app_pages/patient_portal.py
+  Patient booking, personal upcoming appointments, cancellation, and history.
+
+app_pages/doctor_portal.py
+  Doctor agenda, linked patient details, same-doctor history, completion, and
+  upcoming appointments.
+
+app_pages/admin_home.py
+  Administrator overview metrics and today's scheduled appointments.
+
+app_pages/1_Patients.py
+  Search/add/edit/delete patient workflows and existing patient portal access.
+
+app_pages/2_Doctors.py
+  Doctor schedules, doctor account creation, and account provisioning.
+
+app_pages/3_Appointments.py
+  Administrator booking, cancellation, completion, and rescheduling.
+
+app_pages/4_Agenda.py
+  Doctor/day slot view and upcoming appointment filters.
+
+app_pages/5_Patient_History.py
+  Patient history and status filters for administrators.
+
+app_pages/6_Dashboard.py
+  Clinic appointment metrics and Plotly charts.
+
+app_pages/account.py
+  Authenticated password-change form.
+
+db/connection.py
+  Cassandra contact points, port, local data center, load balancing, consistency
+  levels, execution profile, and cached app repository/session.
+
+db/create_admin.py
+  Interactive first-administrator bootstrap command.
+
+db/init_schema.py
+  Retry connection to Cassandra, read schema.cql, and create/update schema.
+
+db/repository.py
+  Prepared CQL statements and patient, doctor, account, appointment, agenda,
+  history, and dashboard data-access operations.
+
+db/schema.cql
+  Keyspace replication and Cassandra table definitions.
+
+db/security.py
+  Password length validation, salted scrypt hashing, and password comparison.
+
+db/slots.py
+  Pure schedule calculation, free-slot filtering, and booking validation.
+
+db/validators.py
+  Patient and doctor input validation and phone normalization.
+
+seed.py
+  Synthetic demo data generator and destructive reset option.
+
+docker-compose.yml
+  Streamlit service, three Cassandra nodes, ports, health checks, and volumes.
+
+Dockerfile
+  Builds the Python app image and installs requirements.txt.
+
+SCREENSHOTS.md and screenshots/
+  Screenshot gallery and unauthenticated sign-in/sign-up captures.
+
+requirements.txt
+  Python application dependency lower bounds.
+
+tests/
+  Focused tests for appointment slots, validation, password hashing, and
+  Cassandra connection-profile behavior.

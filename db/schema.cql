@@ -2,11 +2,14 @@
 -- Run with:  python -m db.init_schema
 -- Every table name is prefixed with the keyspace so the file can be executed
 -- statement by statement without a USE command.
--- SimpleStrategy with replication_factor 1 is fine for a single local node.
--- For a real cluster, switch to NetworkTopologyStrategy.
+-- One logical cluster with three nodes in datacenter1. LOCAL_QUORUM reads and
+-- writes continue when one node is unavailable.
 
 CREATE KEYSPACE IF NOT EXISTS clinic
-  WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+  WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 3};
+
+ALTER KEYSPACE clinic
+  WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 3};
 
 -- One row per patient. Read by id, listed with a full scan (small clinic).
 CREATE TABLE IF NOT EXISTS clinic.patients (
@@ -65,3 +68,21 @@ CREATE TABLE IF NOT EXISTS clinic.appointments_by_patient (
   status         text,
   PRIMARY KEY ((patient_id), appt_datetime, appointment_id)
 ) WITH CLUSTERING ORDER BY (appt_datetime DESC, appointment_id ASC);
+
+-- Login lookup and one-account-per-profile guard.
+CREATE TABLE IF NOT EXISTS clinic.accounts_by_username (
+  username      text PRIMARY KEY,
+  role          text,
+  identity_id   uuid,
+  password_salt blob,
+  password_hash blob,
+  enabled       boolean,
+  created_at    timestamp
+);
+
+CREATE TABLE IF NOT EXISTS clinic.accounts_by_identity (
+  role        text,
+  identity_id uuid,
+  username    text,
+  PRIMARY KEY ((role, identity_id))
+);

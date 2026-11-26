@@ -17,6 +17,8 @@ from cassandra.cluster import NoHostAvailable
 from .connection import connect
 
 SCHEMA_FILE = Path(__file__).with_name("schema.cql")
+MAX_CONNECTION_ATTEMPTS = 120
+RETRY_DELAY_SECONDS = 5
 
 
 def load_statements(path: Path = SCHEMA_FILE) -> list[str]:
@@ -29,13 +31,16 @@ def main() -> None:
     statements = load_statements()
 
     cluster = session = None
-    for attempt in range(1, 31):
+    for attempt in range(1, MAX_CONNECTION_ATTEMPTS + 1):
         try:
             cluster, session = connect(keyspace=None)
             break
         except NoHostAvailable:
-            print(f"Cassandra is not ready yet (attempt {attempt}/30), waiting 5 seconds...")
-            time.sleep(5)
+            print(
+                f"Cassandra is not ready yet (attempt {attempt}/{MAX_CONNECTION_ATTEMPTS}), "
+                f"waiting {RETRY_DELAY_SECONDS} seconds..."
+            )
+            time.sleep(RETRY_DELAY_SECONDS)
     if session is None:
         sys.exit("Could not reach Cassandra. Is the container running? Try: docker compose ps")
 

@@ -16,17 +16,23 @@ STATUS_LABELS = {
 }
 
 
-def setup(title: str, icon: str):
-    """Page config, title, and the repository. Stops the page with a clear
-    message when Cassandra cannot be reached."""
-    st.set_page_config(page_title=f"{title} · Clinic", page_icon=icon, layout="wide")
+def get_repository():
+    return get_repo()
+
+
+def setup(title: str, icon: str, allowed_roles: tuple[str, ...] = ("admin",)):
+    """Check page access, set the title, and return the shared repository."""
+    user = st.session_state.get("clinic_user")
+    if user is None or user["role"] not in allowed_roles:
+        st.error("You do not have permission to access this page.")
+        st.stop()
     st.title(f"{icon} {title}")
     try:
-        return get_repo()
+        return get_repository()
     except Exception as exc:  # NoHostAvailable, InvalidRequest (missing keyspace), ...
         st.error(
-            "Cannot reach the Cassandra database. Start it with `docker compose up -d`, "
-            "then create the tables with `python -m db.init_schema`."
+            "Cannot reach Cassandra. Start the cluster and app with "
+            "`docker compose up -d --build`, then check `docker compose ps`."
         )
         st.caption(f"Technical details: {exc}")
         st.stop()

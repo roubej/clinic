@@ -22,9 +22,9 @@ from datetime import date, datetime, time, timedelta
 
 from cassandra import util
 from cassandra.concurrent import execute_concurrent_with_args
-from cassandra.query import dict_factory
 
 from . import slots
+from .security import hash_password, password_error, verify_password
 
 KEYSPACE = "clinic"
 
@@ -39,6 +39,8 @@ TABLES = (
     "doctors",
     "appointments_by_doctor",
     "appointments_by_patient",
+    "accounts_by_username",
+    "accounts_by_identity",
 )
 
 
@@ -114,7 +116,6 @@ def _appt_from_patient_row(row: dict) -> dict:
 
 class ClinicRepository:
     def __init__(self, session):
-        session.row_factory = dict_factory
         self.s = session
         prep = session.prepare
 
@@ -137,6 +138,32 @@ class ClinicRepository:
         self._release_phone = prep("DELETE FROM patients_by_phone WHERE phone = ?")
         self._phone_lookup = prep(
             "SELECT patient_id FROM patients_by_phone WHERE phone = ?"
+        )
+
+        # ---- accounts -------------------------------------------------
+        self._get_account = prep(
+            "SELECT username, role, identity_id, password_salt, password_hash, enabled "
+            "FROM accounts_by_username WHERE username = ?"
+        )
+        self._get_account_identity = prep(
+            "SELECT username FROM accounts_by_identity WHERE role = ? AND identity_id = ?"
+        )
+        self._create_account = prep(
+            "INSERT INTO accounts_by_username "
+            "(username, role, identity_id, password_salt, password_hash, enabled, created_at) "
+            "VALUES (?, ?, ?, ?, ?, true, ?) IF NOT EXISTS"
+        )
+        self._claim_account_identity = prep(
+            "INSERT INTO accounts_by_identity (role, identity_id, username) "
+            "VALUES (?, ?, ?) IF NOT EXISTS"
+        )
+        self._release_account = prep("DELETE FROM accounts_by_username WHERE username = ?")
+        self._release_account_identity = prep(
+            "DELETE FROM accounts_by_identity WHERE role = ? AND identity_id = ?"
+        )
+        self._update_password = prep(
+            "UPDATE accounts_by_username SET password_salt = ?, password_hash = ? "
+            "WHERE username = ?"
         )
 
         # ---- doctors --------------------------------------------------
@@ -222,6 +249,116 @@ class ClinicRepository:
         row = self.s.execute(self._phone_lookup, (phone,)).one()
         return self.get_patient(row["patient_id"]) if row else None
 
+    @staticmethod
+    def normalize_username(username: str) -> str:
+        return (username or "").strip().casefold()
+
+    @staticmethod
+    def _public_account(row: dict) -> dict:
+        return {
+            "username": row["username"],
+            "role": row["role"],
+            "identity_id": row["identity_id"],
+            "enabled": row["enabled"],
+        }
+
+    def get_account(self, username: str) -> dict | None:
+        normalized = self.normalize_username(username)
+        row = self.s.execute(self._get_account, (normalized,)).one()
+        return self._public_account(row) if row else None
+
+    def get_account_for_identity(self, role: str, identity_id: uuid.UUID) -> str | None:
+        row = self.s.execute(self._get_account_identity, (role, identity_id)).one()
+        return row["username"] if row else None
+
+    def authenticate(self, username: str, password: str) -> dict | None:
+        normalized = self.normalize_username(username)
+        row = self.s.execute(self._get_account, (normalized,)).one()
+        if not row or not row["enabled"]:
+            return None
+        if not verify_password(password, row["password_salt"], row["password_hash"]):
+            return None
+        return self._public_account(row)
+
+    def create_account(
+        self, username: str, password: str, role: str, identity_id: uuid.UUID
+    ) -> None:
+        normalized = self.normalize_username(username)
+        if role not in {"patient", "doctor", "admin"}:
+            raise ClinicError("Invalid account role.")
+        if not normalized:
+            raise ClinicError("Username is required.")
+        password_problem = password_error(password)
+        if password_problem:
+            raise ClinicError(password_problem)
+
+        salt, password_hash = hash_password(password)
+        account = self.s.execute(
+            self._create_account,
+            (normalized, role, identity_id, salt, password_hash, datetime.now()),
+        )
+        if not account.was_applied:
+            raise ClinicError("That username is already in use.")
+        try:
+            claimed = self.s.execute(
+                self._claim_account_identity, (role, identity_id, normalized)
+            )
+            if not claimed.was_applied:
+                raise ClinicError("This profile already has an account.")
+        except Exception:
+            self.s.execute(self._release_account, (normalized,))
+            raise
+
+    def change_password(self, username: str, old_password: str, new_password: str) -> bool:
+        normalized = self.normalize_username(username)
+        row = self.s.execute(self._get_account, (normalized,)).one()
+        if not row or not row["enabled"]:
+            return False
+        if not verify_password(old_password, row["password_salt"], row["password_hash"]):
+            return False
+        password_problem = password_error(new_password)
+        if password_problem:
+            raise ClinicError(password_problem)
+        salt, password_hash = hash_password(new_password)
+        self.s.execute(self._update_password, (salt, password_hash, normalized))
+        return True
+
+    def delete_account(self, username: str, role: str, identity_id: uuid.UUID) -> None:
+        normalized = self.normalize_username(username)
+        self.s.execute(self._release_account_identity, (role, identity_id))
+        self.s.execute(self._release_account, (normalized,))
+
+    def create_doctor_with_account(
+        self,
+        full_name: str,
+        specialty: str,
+        working_days: list[int],
+        start_time: time,
+        end_time: time,
+        slot_minutes: int,
+        username: str,
+        password: str,
+    ) -> uuid.UUID:
+        doctor_id = uuid.uuid4()
+        self.create_account(username, password, "doctor", doctor_id)
+        try:
+            self.s.execute(
+                self._insert_doctor,
+                (
+                    doctor_id,
+                    full_name,
+                    specialty,
+                    set(working_days),
+                    start_time,
+                    end_time,
+                    slot_minutes,
+                ),
+            )
+        except Exception:
+            self.delete_account(username, "doctor", doctor_id)
+            raise
+        return doctor_id
+
     def create_patient(self, first_name, last_name, phone, email, birth_date) -> uuid.UUID:
         patient_id = uuid.uuid4()
         claimed = self.s.execute(self._claim_phone, (phone, patient_id))
@@ -234,6 +371,23 @@ class ClinicRepository:
             )
         except Exception:
             self.s.execute(self._release_phone, (phone,))
+            raise
+        return patient_id
+
+    def register_patient(
+        self,
+        first_name: str,
+        last_name: str,
+        phone: str,
+        email: str,
+        birth_date: date,
+        password: str,
+    ) -> uuid.UUID:
+        patient_id = self.create_patient(first_name, last_name, phone, email, birth_date)
+        try:
+            self.create_account(email, password, "patient", patient_id)
+        except Exception:
+            self.delete_patient(patient_id)
             raise
         return patient_id
 
@@ -266,6 +420,9 @@ class ClinicRepository:
             self.s.execute(self._release_phone, (patient["phone"],))
         self.s.execute(self._delete_patient, (patient_id,))
         self.s.execute(self._delete_history, (patient_id,))
+        username = self.get_account_for_identity("patient", patient_id)
+        if username:
+            self.delete_account(username, "patient", patient_id)
 
     # ==================================================================
     # Doctors

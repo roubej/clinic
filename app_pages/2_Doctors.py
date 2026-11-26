@@ -4,6 +4,8 @@ import pandas as pd
 import streamlit as st
 
 import ui
+from db.repository import ClinicError
+from db.security import password_error
 from db.validators import validate_doctor
 
 repo = ui.setup("Doctors", "🩺")
@@ -11,7 +13,16 @@ ui.show_flash()
 
 DAYS = list(ui.DAY_NAMES)  # [1..7]
 WEEKDAYS = [1, 2, 3, 4, 5]
-ADD_KEYS = ("add_d_name", "add_d_spec", "add_d_days", "add_d_start", "add_d_end", "add_d_slot")
+ADD_KEYS = (
+    "add_d_name",
+    "add_d_spec",
+    "add_d_days",
+    "add_d_start",
+    "add_d_end",
+    "add_d_slot",
+    "add_d_username",
+    "add_d_password",
+)
 
 tab_list, tab_add, tab_edit = st.tabs(["Doctors", "Add doctor", "Edit doctor"])
 
@@ -55,18 +66,42 @@ with tab_add:
         slot = c5.number_input(
             "Slot length (minutes)", min_value=5, max_value=120, value=30, step=5, key="add_d_slot"
         )
+        username = st.text_input("Doctor portal username", key="add_d_username")
+        password = st.text_input(
+            "Initial password (12–128 characters)",
+            type="password",
+            key="add_d_password",
+        )
         submitted = st.form_submit_button("Add doctor", type="primary")
 
     if submitted:
         errors = validate_doctor(name, specialty, days, start, end, int(slot))
+        password_problem = password_error(password)
+        if password_problem:
+            errors.append(password_problem)
+        if not username.strip():
+            errors.append("Doctor portal username is required.")
         if errors:
             for message in errors:
                 st.error(message)
         else:
-            repo.create_doctor(name.strip(), specialty.strip(), days, start, end, int(slot))
+            try:
+                repo.create_doctor_with_account(
+                    name.strip(),
+                    specialty.strip(),
+                    days,
+                    start,
+                    end,
+                    int(slot),
+                    username,
+                    password,
+                )
+            except ClinicError as exc:
+                st.error(str(exc))
+                st.stop()
             for key in ADD_KEYS:
                 st.session_state.pop(key, None)
-            ui.flash("success", f"Doctor {name.strip()} added.")
+            ui.flash("success", f"Doctor {name.strip()} and portal account added.")
             st.rerun()
 
 # ---------------------------------------------------------------- edit
@@ -120,3 +155,37 @@ with tab_edit:
                 )
                 ui.flash("success", "Doctor updated. Existing appointments are not moved.")
                 st.rerun()
+
+        st.divider()
+        account_username = repo.get_account_for_identity("doctor", doctor_id)
+        if account_username:
+            st.caption(f"Doctor portal username: {account_username}")
+        else:
+            st.markdown("**Create doctor portal access**")
+            with st.form(f"doctor_account_form_{k}"):
+                account_name = st.text_input("Username", key=f"doctor_username_{k}")
+                account_password = st.text_input(
+                    "Initial password (12–128 characters)",
+                    type="password",
+                    key=f"doctor_password_{k}",
+                )
+                account_submitted = st.form_submit_button("Create portal account")
+            if account_submitted:
+                password_problem = password_error(account_password)
+                if not account_name.strip():
+                    st.error("Username is required.")
+                elif password_problem:
+                    st.error(password_problem)
+                else:
+                    try:
+                        repo.create_account(
+                            account_name,
+                            account_password,
+                            "doctor",
+                            doctor_id,
+                        )
+                    except ClinicError as exc:
+                        st.error(str(exc))
+                    else:
+                        ui.flash("success", "Doctor portal account created.")
+                        st.rerun()
